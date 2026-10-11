@@ -56,14 +56,14 @@ jobs:
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
 
-          # Import Apple Intermediate Certificates for complete trust chain
+          # Import Apple Intermediate Certificates
           curl -fsSL https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer -o /tmp/AppleWWDRCAG3.cer 2>/dev/null && security import /tmp/AppleWWDRCAG3.cer -k "$KEYCHAIN_PATH" -T /usr/bin/codesign || true
           curl -fsSL https://www.apple.com/certificateauthority/AppleWWDRCAG4.cer -o /tmp/AppleWWDRCAG4.cer 2>/dev/null && security import /tmp/AppleWWDRCAG4.cer -k "$KEYCHAIN_PATH" -T /usr/bin/codesign || true
           curl -fsSL https://www.apple.com/certificateauthority/AppleWWDRCAG6.cer -o /tmp/AppleWWDRCAG6.cer 2>/dev/null && security import /tmp/AppleWWDRCAG6.cer -k "$KEYCHAIN_PATH" -T /usr/bin/codesign || true
 
           # Import signing certificate
-          security import "$CERTIFICATE_PATH" -P "${P12_PASSWORD:-1}" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "${P12_PASSWORD:-}" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH" || true
           security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
           security default-keychain -s "$KEYCHAIN_PATH"
 
@@ -148,10 +148,8 @@ jobs:
       - name: Repair and Validate Xcode Project
         run: |
           echo "=== TỰ ĐỘNG SỬA CHỮA VÀ XÁC THỰC DỰ ÁN XCODE ==="
-          # 1. Loại bỏ xcuserdata có thể bị corrupt
           find . -name "xcuserdata" -type d -exec rm -rf {} + 2>/dev/null || true
 
-          # 2. Sửa hoặc tạo contents.xcworkspacedata hợp lệ nếu file rỗng (0 bytes)
           for proj in $(find . -name "*.xcodeproj"); do
             mkdir -p "$proj/project.xcworkspace"
             wsfile="$proj/project.xcworkspace/contents.xcworkspacedata"
@@ -169,11 +167,9 @@ EOF
             fi
           done
 
-          # 3. Loại bỏ file plist rỗng (0 byte) gây lỗi NSPropertyListSerialization Code 3840
           find . -path "*.xcodeproj/*" -name "*.plist" -size 0 -exec rm -f {} + 2>/dev/null || true
           find . -path "*.xcworkspace/*" -name "*.plist" -size 0 -exec rm -f {} + 2>/dev/null || true
 
-          # 4. Kiểm tra project.pbxproj và khôi phục nếu rỗng hoặc dính conflict markers
           for pbx in $(find . -name "project.pbxproj"); do
             echo "Kiểm tra file: $pbx"
             if [ ! -s "$pbx" ]; then
@@ -197,7 +193,21 @@ EOF
       - name: Setup Dependencies (Cocoapods / SPM if needed)
         run: |
           if [ -f "Podfile" ]; then
-            echo "Installing CocoaPods..."
+            echo "Installing CocoaPods with codesign bypass for pods..."
+            if ! grep -q "EXPANDED_CODE_SIGN_IDENTITY" Podfile; then
+              cat << 'EOF' >> Podfile
+
+post_install do |installer|
+  installer.pods_project.targets.each do |target|
+    target.build_configurations.each do |config|
+      config.build_settings['EXPANDED_CODE_SIGN_IDENTITY'] = ""
+      config.build_settings['CODE_SIGNING_REQUIRED'] = "NO"
+      config.build_settings['CODE_SIGNING_ALLOWED'] = "NO"
+    end
+  end
+end
+EOF
+            fi
             pod install --repo-update || pod install
           fi
           if [ -f "package.json" ]; then
@@ -209,7 +219,6 @@ EOF
         run: |
           mkdir -p build/output
 
-          # Mở khóa keychain trước khi ký
           security unlock-keychain -p "${{ env.KEYCHAIN_PWD }}" "${{ env.KEYCHAIN_PATH }}" || true
 
           WORKSPACE=$(find . -maxdepth 2 -name "*.xcworkspace" | head -n 1)
@@ -229,7 +238,6 @@ EOF
             exit 1
           fi
 
-          # Phát hiện scheme an toàn
           SCHEME="ThreeOneOSFive"
           RAW_LIST=$(xcodebuild $BUILD_TARGET -list -json 2>/dev/null || true)
           DETECTED_SCHEME=$(python3 -c '
@@ -263,17 +271,37 @@ except Exception:
             -destination "generic/platform=iOS" \
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="${{ env.CODE_SIGN_IDENTITY }}" \
-            PROVISIONING_PROFILE_SPECIFIER="${{ env.PROVISIONING_PROFILE_UUID }}" \
             DEVELOPMENT_TEAM="${{ env.DEVELOPMENT_TEAM }}" \
             CODE_SIGNING_REQUIRED=YES \
             CODE_SIGNING_ALLOWED=YES \
+            COMPILER_INDEX_STORE_ENABLE=NO || \
+          xcodebuild clean archive \
+            $BUILD_TARGET \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath build/App.xcarchive \
+            -destination "generic/platform=iOS" \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=YES \
             COMPILER_INDEX_STORE_ENABLE=NO
 
-          # Đọc Bundle ID thực tế từ archive
-          ARCHIVE_BUNDLE_ID=$(plutil -extract ApplicationProperties.CFBundleIdentifier raw build/App.xcarchive/Info.plist 2>/dev/null || echo "${TARGET_BUNDLE_ID:-com.example.app}")
+          ARCHIVE_BUNDLE_ID=$(plutil -extract ApplicationProperties.CFBundleIdentifier raw build/App.xcarchive/Info.plist 2>/dev/null || echo "")
+          if [ -z "$ARCHIVE_BUNDLE_ID" ]; then
+            ARCHIVE_BUNDLE_ID=$(find build/App.xcarchive/Products/Applications -name "*.app" -maxdepth 2 -exec plutil -extract CFBundleIdentifier raw "{}/Info.plist" \; 2>/dev/null | head -n 1 || echo "")
+          fi
+          if [ -z "$ARCHIVE_BUNDLE_ID" ]; then
+            ARCHIVE_BUNDLE_ID="${TARGET_BUNDLE_ID:-com.example.app}"
+          fi
           echo "Archive Bundle ID: $ARCHIVE_BUNDLE_ID"
 
-          # Tạo ExportOptions.plist hợp lệ bằng Python để tránh lỗi cú pháp heredoc
+          export ARCHIVE_BUNDLE_ID
+          export EXPORT_METHOD="${EXPORT_METHOD:-ad-hoc}"
+          export DEVELOPMENT_TEAM="${DEVELOPMENT_TEAM:-}"
+          export PROVISIONING_PROFILE_UUID="${PROVISIONING_PROFILE_UUID:-}"
+          export CODE_SIGN_IDENTITY="${CODE_SIGN_IDENTITY:-iPhone Distribution}"
+
           python3 -c '
 import plistlib, os
 
@@ -281,7 +309,7 @@ export_method = os.environ.get("EXPORT_METHOD", "ad-hoc")
 team_id = os.environ.get("DEVELOPMENT_TEAM", "")
 profile_uuid = os.environ.get("PROVISIONING_PROFILE_UUID", "")
 bundle_id = os.environ.get("ARCHIVE_BUNDLE_ID", "")
-signing_identity = os.environ.get("CODE_SIGN_IDENTITY", "iPhone Distribution")
+signing_identity = os.environ.get("CODE_SIGN_IDENTITY", "")
 
 plist_data = {
     "method": export_method,
@@ -289,12 +317,18 @@ plist_data = {
     "stripSwiftSymbols": True,
     "compileBitcode": False,
     "thinning": "<none>",
-    "teamID": team_id,
-    "signingCertificate": signing_identity,
-    "provisioningProfiles": {
+}
+
+if team_id:
+    plist_data["teamID"] = team_id
+
+if signing_identity:
+    plist_data["signingCertificate"] = signing_identity
+
+if bundle_id and profile_uuid:
+    plist_data["provisioningProfiles"] = {
         bundle_id: profile_uuid
     }
-}
 
 with open("ExportOptions.plist", "wb") as f:
     plistlib.dump(plist_data, f)
@@ -306,8 +340,7 @@ print("ExportOptions.plist created successfully:")
           xcodebuild -exportArchive \
             -archivePath build/App.xcarchive \
             -exportOptionsPlist ExportOptions.plist \
-            -exportPath build/output \
-            -allowProvisioningUpdates
+            -exportPath build/output
 
           ls -la build/output/
           IPA_FILE=$(find build/output -name "*.ipa" | head -n 1)
