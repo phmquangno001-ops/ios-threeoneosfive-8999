@@ -6,7 +6,7 @@ on:
       bundle_id:
         description: Target bundle identifier
         required: false
-        default: com.apple.mobile.MobileHouseArrest
+        default: garlic2817.jaguar9702
         type: string
       project_name:
         description: Output IPA name
