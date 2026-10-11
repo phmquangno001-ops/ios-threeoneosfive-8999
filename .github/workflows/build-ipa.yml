@@ -24,12 +24,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Select Xcode Version
         run: |
           echo "Available Xcode versions:"
           ls -d /Applications/Xcode*.app || true
+          # Default to active Xcode or latest 15.x / 16.x
           sudo xcode-select -s /Applications/Xcode_15.4.app 2>/dev/null || \
           sudo xcode-select -s /Applications/Xcode_15.3.app 2>/dev/null || \
           sudo xcode-select -s /Applications/Xcode.app
@@ -50,35 +51,21 @@ jobs:
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
           KEYCHAIN_PWD="${KEYCHAIN_PASSWORD:-buildpassword123}"
 
+          # Decode p12
           echo "$BUILD_CERTIFICATE_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
 
+          # Create keychain
           security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
 
-          # Import Apple Intermediate Certificates
-          curl -fsSL https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer -o /tmp/AppleWWDRCAG3.cer 2>/dev/null && security import /tmp/AppleWWDRCAG3.cer -k "$KEYCHAIN_PATH" -T /usr/bin/codesign || true
-          curl -fsSL https://www.apple.com/certificateauthority/AppleWWDRCAG4.cer -o /tmp/AppleWWDRCAG4.cer 2>/dev/null && security import /tmp/AppleWWDRCAG4.cer -k "$KEYCHAIN_PATH" -T /usr/bin/codesign || true
-          curl -fsSL https://www.apple.com/certificateauthority/AppleWWDRCAG6.cer -o /tmp/AppleWWDRCAG6.cer 2>/dev/null && security import /tmp/AppleWWDRCAG6.cer -k "$KEYCHAIN_PATH" -T /usr/bin/codesign || true
-
-          # Import signing certificate
-          security import "$CERTIFICATE_PATH" -P "${P12_PASSWORD:-}" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH" || true
-          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
-          security default-keychain -s "$KEYCHAIN_PATH"
+          # Import certificate
+          security import "$CERTIFICATE_PATH" -P "${P12_PASSWORD:-1}" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
 
           echo "Certificates in keychain:"
           security find-identity -v -p codesigning "$KEYCHAIN_PATH" || true
-          
-          SIGNING_IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -o '".*"' | head -n 1 | tr -d '"' || echo "")
-          if [ -n "$SIGNING_IDENTITY" ]; then
-            echo "Discovered Signing Identity: $SIGNING_IDENTITY"
-            echo "CODE_SIGN_IDENTITY=$SIGNING_IDENTITY" >> $GITHUB_ENV
-          else
-            echo "CODE_SIGN_IDENTITY=iPhone Distribution" >> $GITHUB_ENV
-          fi
-          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> $GITHUB_ENV
-          echo "KEYCHAIN_PWD=$KEYCHAIN_PWD" >> $GITHUB_ENV
 
       - name: Install Provisioning Profile (.mobileprovision)
         env:
@@ -93,6 +80,7 @@ jobs:
           PROFILE_RAW=$RUNNER_TEMP/profile.mobileprovision
           echo "$BUILD_PROVISION_PROFILE_BASE64" | base64 --decode > "$PROFILE_RAW"
 
+          # Extract UUID
           UUID=$(security cms -D -i "$PROFILE_RAW" 2>/dev/null | plutil -extract UUID raw - 2>/dev/null || echo "")
           if [ -z "$UUID" ]; then
             UUID="temp-build-profile"
@@ -102,32 +90,17 @@ jobs:
           cp "$PROFILE_RAW" ~/Library/MobileDevice/Provisioning\ Profiles/default.mobileprovision
           echo "PROVISIONING_PROFILE_UUID=$UUID" >> $GITHUB_ENV
 
+          # Extract Team ID
           TEAM_ID=$(security cms -D -i "$PROFILE_RAW" 2>/dev/null | plutil -extract TeamIdentifier.0 raw - 2>/dev/null || echo "")
           echo "DEVELOPMENT_TEAM=$TEAM_ID" >> $GITHUB_ENV
           echo "Team ID: $TEAM_ID"
-
-          # Detect export method from profile
-          METHOD="ad-hoc"
-          if security cms -D -i "$PROFILE_RAW" 2>/dev/null | grep -q "<key>ProvisionedDevices</key>"; then
-            GET_TASK_ALLOW=$(security cms -D -i "$PROFILE_RAW" 2>/dev/null | plutil -extract Entitlements.get-task-allow raw - 2>/dev/null || echo "false")
-            if [ "$GET_TASK_ALLOW" = "true" ]; then
-              METHOD="development"
-            else
-              METHOD="ad-hoc"
-            fi
-          elif security cms -D -i "$PROFILE_RAW" 2>/dev/null | grep -q "<key>ProvisionsAllDevices</key>"; then
-            METHOD="enterprise"
-          else
-            METHOD="app-store"
-          fi
-          echo "Detected export method: $METHOD"
-          echo "EXPORT_METHOD=$METHOD" >> $GITHUB_ENV
 
       - name: Auto-Sync Bundle Identifier with Provisioning Profile
         run: |
           echo "=== KIỂM TRA VÀ TỰ ĐỘNG ĐỒNG BỘ BUNDLE IDENTIFIER KHỚP VỚI CHỨNG CHỈ ==="
           PROFILE_RAW=$RUNNER_TEMP/profile.mobileprovision
           
+          # Extract Application Identifier from Profile
           APP_ID=$(security cms -D -i "$PROFILE_RAW" 2>/dev/null | plutil -extract Entitlements.application-identifier raw - 2>/dev/null || echo "")
           echo "Profile Entitlements App ID: $APP_ID"
           
@@ -137,77 +110,20 @@ jobs:
               echo "Chứng chỉ yêu cầu chính xác Bundle ID: $PROV_BUNDLE_ID"
               echo "TARGET_BUNDLE_ID=$PROV_BUNDLE_ID" >> $GITHUB_ENV
               
-              echo "Đang tự động sửa Bundle Identifier trong mã nguồn..."
+              # Tự động đồng bộ Bundle ID trong mọi file project.pbxproj và Info.plist
+              echo "Đang tự động sửa Bundle Identifier trong mã nguồn để khớp hoàn toàn với chứng chỉ..."
               find . -name "project.pbxproj" -exec sed -i '' "s/PRODUCT_BUNDLE_IDENTIFIER = [^;]*;/PRODUCT_BUNDLE_IDENTIFIER = $PROV_BUNDLE_ID;/g" {} + 2>/dev/null || true
               find . -name "Info.plist" -exec plutil -replace CFBundleIdentifier -string "$PROV_BUNDLE_ID" {} + 2>/dev/null || true
+              echo "Đã tự động sửa khớp Bundle ID: $PROV_BUNDLE_ID"
             else
               echo "Chứng chỉ là Wildcard (*), cho phép build mọi Bundle ID!"
             fi
           fi
 
-      - name: Repair and Validate Xcode Project
-        run: |
-          echo "=== TỰ ĐỘNG SỬA CHỮA VÀ XÁC THỰC DỰ ÁN XCODE ==="
-          find . -name "xcuserdata" -type d -exec rm -rf {} + 2>/dev/null || true
-
-          for proj in $(find . -name "*.xcodeproj"); do
-            mkdir -p "$proj/project.xcworkspace"
-            wsfile="$proj/project.xcworkspace/contents.xcworkspacedata"
-            if [ ! -s "$wsfile" ]; then
-              echo "Khôi phục $wsfile rỗng..."
-              cat << 'EOF' > "$wsfile"
-<?xml version="1.0" encoding="UTF-8"?>
-<Workspace
-   version = "1.0">
-   <FileRef
-      location = "self:">
-   </FileRef>
-</Workspace>
-EOF
-            fi
-          done
-
-          find . -path "*.xcodeproj/*" -name "*.plist" -size 0 -exec rm -f {} + 2>/dev/null || true
-          find . -path "*.xcworkspace/*" -name "*.plist" -size 0 -exec rm -f {} + 2>/dev/null || true
-
-          for pbx in $(find . -name "project.pbxproj"); do
-            echo "Kiểm tra file: $pbx"
-            if [ ! -s "$pbx" ]; then
-              echo "CẢNH BÁO: $pbx bị rỗng! Đang khôi phục từ git history..."
-              COMMIT=$(git log -n 5 --diff-filter=AM --format="%H" -- "$pbx" | head -n 1)
-              if [ -n "$COMMIT" ]; then
-                git checkout "$COMMIT" -- "$pbx"
-              fi
-            fi
-
-            if grep -q "<<<<<<<" "$pbx" 2>/dev/null; then
-              echo "Phát hiện Git conflict markers trong $pbx, đang giải quyết..."
-              sed -i '' '/<<<<<<</d' "$pbx"
-              sed -i '' '/=======/d' "$pbx"
-              sed -i '' '/>>>>>>>/d' "$pbx"
-            fi
-
-            plutil -lint "$pbx" || true
-          done
-
       - name: Setup Dependencies (Cocoapods / SPM if needed)
         run: |
           if [ -f "Podfile" ]; then
-            echo "Installing CocoaPods with codesign bypass for pods..."
-            if ! grep -q "EXPANDED_CODE_SIGN_IDENTITY" Podfile; then
-              cat << 'EOF' >> Podfile
-
-post_install do |installer|
-  installer.pods_project.targets.each do |target|
-    target.build_configurations.each do |config|
-      config.build_settings['EXPANDED_CODE_SIGN_IDENTITY'] = ""
-      config.build_settings['CODE_SIGNING_REQUIRED'] = "NO"
-      config.build_settings['CODE_SIGNING_ALLOWED'] = "NO"
-    end
-  end
-end
-EOF
-            fi
+            echo "Installing CocoaPods..."
             pod install --repo-update || pod install
           fi
           if [ -f "package.json" ]; then
@@ -215,12 +131,37 @@ EOF
             npm ci || npm install
           fi
 
+      - name: Prepare ExportOptions.plist
+        run: |
+          cat << 'EOF' > ExportOptions.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>method</key>
+              <string>ad-hoc</string>
+              <key>signingStyle</key>
+              <string>manual</string>
+              <key>stripSwiftSymbols</key>
+              <true/>
+              <key>compileBitcode</key>
+              <false/>
+              <key>thinning</key>
+              <string>&lt;none&gt;</string>
+              <key>teamID</key>
+              <string>${{ env.DEVELOPMENT_TEAM }}</string>
+              <key>provisioningProfiles</key>
+              <dict>
+              </dict>
+          </dict>
+          </plist>
+          EOF
+
       - name: Build Archive & Export IPA
         run: |
           mkdir -p build/output
 
-          security unlock-keychain -p "${{ env.KEYCHAIN_PWD }}" "${{ env.KEYCHAIN_PATH }}" || true
-
+          # Locate project or workspace
           WORKSPACE=$(find . -maxdepth 2 -name "*.xcworkspace" | head -n 1)
           PROJECT=$(find . -maxdepth 2 -name "*.xcodeproj" | head -n 1)
 
@@ -229,36 +170,26 @@ EOF
           elif [ -n "$PROJECT" ]; then
             BUILD_TARGET="-project $PROJECT"
           else
+            echo "No xcode project found directly, checking for Swift source or payload..."
             if [ -d "Payload" ]; then
               echo "Existing Payload found, packing into IPA directly..."
               zip -r build/output/App.ipa Payload
               exit 0
             fi
-            echo "::error::No Xcode project found!"
+            echo "::error::No Xcode project, workspace, or Payload directory found in repository."
             exit 1
           fi
 
-          SCHEME="ThreeOneOSFive"
-          RAW_LIST=$(xcodebuild $BUILD_TARGET -list -json 2>/dev/null || true)
-          DETECTED_SCHEME=$(python3 -c '
-import json, sys
-try:
-    data = json.loads(sys.argv[1])
-    schemes = data.get("project", {}).get("schemes", []) or data.get("workspace", {}).get("schemes", [])
-    if schemes and len(schemes) > 0:
-        print(schemes[0])
-except Exception:
-    pass
-' "$RAW_LIST" 2>/dev/null || echo "")
+          # List schemes
+          echo "Listing schemes in target:"
+          xcodebuild $BUILD_TARGET -list || true
 
-          if [ -n "$DETECTED_SCHEME" ]; then
+          SCHEME="ThreeOneOSFive"
+          # If scheme does not exist, pick the first scheme
+          DETECTED_SCHEME=$(xcodebuild $BUILD_TARGET -list -json 2>/dev/null | plutil -extract project.schemes.0 raw - 2>/dev/null || echo "$SCHEME")
+          if [ -n "$DETECTED_SCHEME" ] && [ "$DETECTED_SCHEME" != "$SCHEME" ]; then
             echo "Using detected scheme: $DETECTED_SCHEME"
             SCHEME="$DETECTED_SCHEME"
-          else
-            SHARED_SCHEME=$(find . -name "*.xcscheme" -exec basename {} .xcscheme \; 2>/dev/null | head -n 1)
-            if [ -n "$SHARED_SCHEME" ]; then
-              SCHEME="$SHARED_SCHEME"
-            fi
           fi
 
           echo "Archiving with scheme: $SCHEME"
@@ -270,78 +201,18 @@ except Exception:
             -archivePath build/App.xcarchive \
             -destination "generic/platform=iOS" \
             CODE_SIGN_STYLE=Manual \
-            CODE_SIGN_IDENTITY="${{ env.CODE_SIGN_IDENTITY }}" \
+            PROVISIONING_PROFILE_SPECIFIER="${{ env.PROVISIONING_PROFILE_UUID }}" \
             DEVELOPMENT_TEAM="${{ env.DEVELOPMENT_TEAM }}" \
-            CODE_SIGNING_REQUIRED=YES \
-            CODE_SIGNING_ALLOWED=YES \
-            COMPILER_INDEX_STORE_ENABLE=NO || \
-          xcodebuild clean archive \
-            $BUILD_TARGET \
-            -scheme "$SCHEME" \
-            -configuration Release \
-            -sdk iphoneos \
-            -archivePath build/App.xcarchive \
-            -destination "generic/platform=iOS" \
-            CODE_SIGN_IDENTITY="-" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=YES \
             COMPILER_INDEX_STORE_ENABLE=NO
-
-          ARCHIVE_BUNDLE_ID=$(plutil -extract ApplicationProperties.CFBundleIdentifier raw build/App.xcarchive/Info.plist 2>/dev/null || echo "")
-          if [ -z "$ARCHIVE_BUNDLE_ID" ]; then
-            ARCHIVE_BUNDLE_ID=$(find build/App.xcarchive/Products/Applications -name "*.app" -maxdepth 2 -exec plutil -extract CFBundleIdentifier raw "{}/Info.plist" \; 2>/dev/null | head -n 1 || echo "")
-          fi
-          if [ -z "$ARCHIVE_BUNDLE_ID" ]; then
-            ARCHIVE_BUNDLE_ID="${TARGET_BUNDLE_ID:-com.example.app}"
-          fi
-          echo "Archive Bundle ID: $ARCHIVE_BUNDLE_ID"
-
-          export ARCHIVE_BUNDLE_ID
-          export EXPORT_METHOD="${EXPORT_METHOD:-ad-hoc}"
-          export DEVELOPMENT_TEAM="${DEVELOPMENT_TEAM:-}"
-          export PROVISIONING_PROFILE_UUID="${PROVISIONING_PROFILE_UUID:-}"
-          export CODE_SIGN_IDENTITY="${CODE_SIGN_IDENTITY:-iPhone Distribution}"
-
-          python3 -c '
-import plistlib, os
-
-export_method = os.environ.get("EXPORT_METHOD", "ad-hoc")
-team_id = os.environ.get("DEVELOPMENT_TEAM", "")
-profile_uuid = os.environ.get("PROVISIONING_PROFILE_UUID", "")
-bundle_id = os.environ.get("ARCHIVE_BUNDLE_ID", "")
-signing_identity = os.environ.get("CODE_SIGN_IDENTITY", "")
-
-plist_data = {
-    "method": export_method,
-    "signingStyle": "manual",
-    "stripSwiftSymbols": True,
-    "compileBitcode": False,
-    "thinning": "<none>",
-}
-
-if team_id:
-    plist_data["teamID"] = team_id
-
-if signing_identity:
-    plist_data["signingCertificate"] = signing_identity
-
-if bundle_id and profile_uuid:
-    plist_data["provisioningProfiles"] = {
-        bundle_id: profile_uuid
-    }
-
-with open("ExportOptions.plist", "wb") as f:
-    plistlib.dump(plist_data, f)
-print("ExportOptions.plist created successfully:")
-'
-          cat ExportOptions.plist
 
           echo "Exporting IPA..."
           xcodebuild -exportArchive \
             -archivePath build/App.xcarchive \
             -exportOptionsPlist ExportOptions.plist \
-            -exportPath build/output
+            -exportPath build/output \
+            -allowProvisioningUpdates
 
+          # Check output
           ls -la build/output/
           IPA_FILE=$(find build/output -name "*.ipa" | head -n 1)
           if [ -z "$IPA_FILE" ]; then
