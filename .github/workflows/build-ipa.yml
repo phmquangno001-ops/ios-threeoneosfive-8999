@@ -24,13 +24,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 1
+          fetch-depth: 0
 
       - name: Select Xcode Version
         run: |
           echo "Available Xcode versions:"
           ls -d /Applications/Xcode*.app || true
-          # Default to active Xcode or latest 15.x / 16.x
           sudo xcode-select -s /Applications/Xcode_15.4.app 2>/dev/null || \
           sudo xcode-select -s /Applications/Xcode_15.3.app 2>/dev/null || \
           sudo xcode-select -s /Applications/Xcode.app
@@ -51,18 +50,22 @@ jobs:
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
           KEYCHAIN_PWD="${KEYCHAIN_PASSWORD:-buildpassword123}"
 
-          # Decode p12
           echo "$BUILD_CERTIFICATE_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
 
-          # Create keychain
           security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
 
-          # Import certificate
+          # Import Apple Intermediate Certificates for complete trust chain
+          curl -fsSL https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer -o /tmp/AppleWWDRCAG3.cer 2>/dev/null && security import /tmp/AppleWWDRCAG3.cer -k "$KEYCHAIN_PATH" -T /usr/bin/codesign || true
+          curl -fsSL https://www.apple.com/certificateauthority/AppleWWDRCAG4.cer -o /tmp/AppleWWDRCAG4.cer 2>/dev/null && security import /tmp/AppleWWDRCAG4.cer -k "$KEYCHAIN_PATH" -T /usr/bin/codesign || true
+          curl -fsSL https://www.apple.com/certificateauthority/AppleWWDRCAG6.cer -o /tmp/AppleWWDRCAG6.cer 2>/dev/null && security import /tmp/AppleWWDRCAG6.cer -k "$KEYCHAIN_PATH" -T /usr/bin/codesign || true
+
+          # Import signing certificate
           security import "$CERTIFICATE_PATH" -P "${P12_PASSWORD:-1}" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
-          security list-keychain -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          security default-keychain -s "$KEYCHAIN_PATH"
 
           echo "Certificates in keychain:"
           security find-identity -v -p codesigning "$KEYCHAIN_PATH" || true
@@ -80,7 +83,6 @@ jobs:
           PROFILE_RAW=$RUNNER_TEMP/profile.mobileprovision
           echo "$BUILD_PROVISION_PROFILE_BASE64" | base64 --decode > "$PROFILE_RAW"
 
-          # Extract UUID
           UUID=$(security cms -D -i "$PROFILE_RAW" 2>/dev/null | plutil -extract UUID raw - 2>/dev/null || echo "")
           if [ -z "$UUID" ]; then
             UUID="temp-build-profile"
@@ -90,7 +92,6 @@ jobs:
           cp "$PROFILE_RAW" ~/Library/MobileDevice/Provisioning\ Profiles/default.mobileprovision
           echo "PROVISIONING_PROFILE_UUID=$UUID" >> $GITHUB_ENV
 
-          # Extract Team ID
           TEAM_ID=$(security cms -D -i "$PROFILE_RAW" 2>/dev/null | plutil -extract TeamIdentifier.0 raw - 2>/dev/null || echo "")
           echo "DEVELOPMENT_TEAM=$TEAM_ID" >> $GITHUB_ENV
           echo "Team ID: $TEAM_ID"
@@ -100,7 +101,6 @@ jobs:
           echo "=== KIỂM TRA VÀ TỰ ĐỘNG ĐỒNG BỘ BUNDLE IDENTIFIER KHỚP VỚI CHỨNG CHỈ ==="
           PROFILE_RAW=$RUNNER_TEMP/profile.mobileprovision
           
-          # Extract Application Identifier from Profile
           APP_ID=$(security cms -D -i "$PROFILE_RAW" 2>/dev/null | plutil -extract Entitlements.application-identifier raw - 2>/dev/null || echo "")
           echo "Profile Entitlements App ID: $APP_ID"
           
@@ -110,15 +110,62 @@ jobs:
               echo "Chứng chỉ yêu cầu chính xác Bundle ID: $PROV_BUNDLE_ID"
               echo "TARGET_BUNDLE_ID=$PROV_BUNDLE_ID" >> $GITHUB_ENV
               
-              # Tự động đồng bộ Bundle ID trong mọi file project.pbxproj và Info.plist
-              echo "Đang tự động sửa Bundle Identifier trong mã nguồn để khớp hoàn toàn với chứng chỉ..."
+              echo "Đang tự động sửa Bundle Identifier trong mã nguồn..."
               find . -name "project.pbxproj" -exec sed -i '' "s/PRODUCT_BUNDLE_IDENTIFIER = [^;]*;/PRODUCT_BUNDLE_IDENTIFIER = $PROV_BUNDLE_ID;/g" {} + 2>/dev/null || true
               find . -name "Info.plist" -exec plutil -replace CFBundleIdentifier -string "$PROV_BUNDLE_ID" {} + 2>/dev/null || true
-              echo "Đã tự động sửa khớp Bundle ID: $PROV_BUNDLE_ID"
             else
               echo "Chứng chỉ là Wildcard (*), cho phép build mọi Bundle ID!"
             fi
           fi
+
+      - name: Repair and Validate Xcode Project
+        run: |
+          echo "=== TỰ ĐỘNG SỬA CHỮA VÀ XÁC THỰC DỰ ÁN XCODE ==="
+          # 1. Loại bỏ xcuserdata có thể bị corrupt
+          find . -name "xcuserdata" -type d -exec rm -rf {} + 2>/dev/null || true
+
+          # 2. Sửa hoặc tạo contents.xcworkspacedata hợp lệ nếu file rỗng (0 bytes)
+          for proj in $(find . -name "*.xcodeproj"); do
+            mkdir -p "$proj/project.xcworkspace"
+            wsfile="$proj/project.xcworkspace/contents.xcworkspacedata"
+            if [ ! -s "$wsfile" ]; then
+              echo "Khôi phục $wsfile rỗng..."
+              cat << 'EOF' > "$wsfile"
+<?xml version="1.0" encoding="UTF-8"?>
+<Workspace
+   version = "1.0">
+   <FileRef
+      location = "self:">
+   </FileRef>
+</Workspace>
+EOF
+            fi
+          done
+
+          # 3. Loại bỏ file plist rỗng (0 byte) gây lỗi NSPropertyListSerialization Code 3840
+          find . -path "*.xcodeproj/*" -name "*.plist" -size 0 -exec rm -f {} + 2>/dev/null || true
+          find . -path "*.xcworkspace/*" -name "*.plist" -size 0 -exec rm -f {} + 2>/dev/null || true
+
+          # 4. Kiểm tra project.pbxproj và khôi phục nếu rỗng hoặc dính conflict markers
+          for pbx in $(find . -name "project.pbxproj"); do
+            echo "Kiểm tra file: $pbx"
+            if [ ! -s "$pbx" ]; then
+              echo "CẢNH BÁO: $pbx bị rỗng! Đang khôi phục từ git history..."
+              COMMIT=$(git log -n 5 --diff-filter=AM --format="%H" -- "$pbx" | head -n 1)
+              if [ -n "$COMMIT" ]; then
+                git checkout "$COMMIT" -- "$pbx"
+              fi
+            fi
+
+            if grep -q "<<<<<<<" "$pbx" 2>/dev/null; then
+              echo "Phát hiện Git conflict markers trong $pbx, đang giải quyết..."
+              sed -i '' '/<<<<<<</d' "$pbx"
+              sed -i '' '/=======/d' "$pbx"
+              sed -i '' '/>>>>>>>/d' "$pbx"
+            fi
+
+            plutil -lint "$pbx" || true
+          done
 
       - name: Setup Dependencies (Cocoapods / SPM if needed)
         run: |
@@ -131,9 +178,70 @@ jobs:
             npm ci || npm install
           fi
 
-      - name: Prepare ExportOptions.plist
+      - name: Build Archive & Export IPA
         run: |
-          cat << 'EOF' > ExportOptions.plist
+          mkdir -p build/output
+
+          WORKSPACE=$(find . -maxdepth 2 -name "*.xcworkspace" | head -n 1)
+          PROJECT=$(find . -maxdepth 2 -name "*.xcodeproj" | head -n 1)
+
+          if [ -n "$WORKSPACE" ]; then
+            BUILD_TARGET="-workspace $WORKSPACE"
+          elif [ -n "$PROJECT" ]; then
+            BUILD_TARGET="-project $PROJECT"
+          else
+            if [ -d "Payload" ]; then
+              echo "Existing Payload found, packing into IPA directly..."
+              zip -r build/output/App.ipa Payload
+              exit 0
+            fi
+            echo "::error::No Xcode project found!"
+            exit 1
+          fi
+
+          # Phát hiện scheme an toàn bằng Python
+          SCHEME="ThreeOneOSFive"
+          RAW_LIST=$(xcodebuild $BUILD_TARGET -list -json 2>/dev/null || true)
+          DETECTED_SCHEME=$(python3 -c '
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+    schemes = data.get("project", {}).get("schemes", []) or data.get("workspace", {}).get("schemes", [])
+    if schemes and len(schemes) > 0:
+        print(schemes[0])
+except Exception:
+    pass
+' "$RAW_LIST" 2>/dev/null || echo "")
+
+          if [ -n "$DETECTED_SCHEME" ]; then
+            echo "Using detected scheme: $DETECTED_SCHEME"
+            SCHEME="$DETECTED_SCHEME"
+          else
+            SHARED_SCHEME=$(find . -name "*.xcscheme" -exec basename {} .xcscheme \; 2>/dev/null | head -n 1)
+            if [ -n "$SHARED_SCHEME" ]; then
+              SCHEME="$SHARED_SCHEME"
+            fi
+          fi
+
+          echo "Archiving with scheme: $SCHEME"
+          xcodebuild clean archive \
+            $BUILD_TARGET \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath build/App.xcarchive \
+            -destination "generic/platform=iOS" \
+            CODE_SIGN_STYLE=Manual \
+            PROVISIONING_PROFILE_SPECIFIER="${{ env.PROVISIONING_PROFILE_UUID }}" \
+            DEVELOPMENT_TEAM="${{ env.DEVELOPMENT_TEAM }}" \
+            COMPILER_INDEX_STORE_ENABLE=NO
+
+          # Đọc Bundle ID thực tế từ archive
+          ARCHIVE_BUNDLE_ID=$(plutil -extract ApplicationProperties.CFBundleIdentifier raw build/App.xcarchive/Info.plist 2>/dev/null || echo "${TARGET_BUNDLE_ID:-com.example.app}")
+          echo "Archive Bundle ID: $ARCHIVE_BUNDLE_ID"
+
+          # Sinh ExportOptions.plist tự động
+          cat << EOF > ExportOptions.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -152,58 +260,12 @@ jobs:
               <string>${{ env.DEVELOPMENT_TEAM }}</string>
               <key>provisioningProfiles</key>
               <dict>
+                  <key>${ARCHIVE_BUNDLE_ID}</key>
+                  <string>${{ env.PROVISIONING_PROFILE_UUID }}</string>
               </dict>
           </dict>
           </plist>
           EOF
-
-      - name: Build Archive & Export IPA
-        run: |
-          mkdir -p build/output
-
-          # Locate project or workspace
-          WORKSPACE=$(find . -maxdepth 2 -name "*.xcworkspace" | head -n 1)
-          PROJECT=$(find . -maxdepth 2 -name "*.xcodeproj" | head -n 1)
-
-          if [ -n "$WORKSPACE" ]; then
-            BUILD_TARGET="-workspace $WORKSPACE"
-          elif [ -n "$PROJECT" ]; then
-            BUILD_TARGET="-project $PROJECT"
-          else
-            echo "No xcode project found directly, checking for Swift source or payload..."
-            if [ -d "Payload" ]; then
-              echo "Existing Payload found, packing into IPA directly..."
-              zip -r build/output/App.ipa Payload
-              exit 0
-            fi
-            echo "::error::No Xcode project, workspace, or Payload directory found in repository."
-            exit 1
-          fi
-
-          # List schemes
-          echo "Listing schemes in target:"
-          xcodebuild $BUILD_TARGET -list || true
-
-          SCHEME="ThreeOneOSFive"
-          # If scheme does not exist, pick the first scheme
-          DETECTED_SCHEME=$(xcodebuild $BUILD_TARGET -list -json 2>/dev/null | plutil -extract project.schemes.0 raw - 2>/dev/null || echo "$SCHEME")
-          if [ -n "$DETECTED_SCHEME" ] && [ "$DETECTED_SCHEME" != "$SCHEME" ]; then
-            echo "Using detected scheme: $DETECTED_SCHEME"
-            SCHEME="$DETECTED_SCHEME"
-          fi
-
-          echo "Archiving with scheme: $SCHEME"
-          xcodebuild clean archive \
-            $BUILD_TARGET \
-            -scheme "$SCHEME" \
-            -configuration Release \
-            -sdk iphoneos \
-            -archivePath build/App.xcarchive \
-            -destination "generic/platform=iOS" \
-            CODE_SIGN_STYLE=Manual \
-            PROVISIONING_PROFILE_SPECIFIER="${{ env.PROVISIONING_PROFILE_UUID }}" \
-            DEVELOPMENT_TEAM="${{ env.DEVELOPMENT_TEAM }}" \
-            COMPILER_INDEX_STORE_ENABLE=NO
 
           echo "Exporting IPA..."
           xcodebuild -exportArchive \
@@ -212,7 +274,6 @@ jobs:
             -exportPath build/output \
             -allowProvisioningUpdates
 
-          # Check output
           ls -la build/output/
           IPA_FILE=$(find build/output -name "*.ipa" | head -n 1)
           if [ -z "$IPA_FILE" ]; then
