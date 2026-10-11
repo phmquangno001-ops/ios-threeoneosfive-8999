@@ -69,6 +69,16 @@ jobs:
 
           echo "Certificates in keychain:"
           security find-identity -v -p codesigning "$KEYCHAIN_PATH" || true
+          
+          SIGNING_IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -o '".*"' | head -n 1 | tr -d '"' || echo "")
+          if [ -n "$SIGNING_IDENTITY" ]; then
+            echo "Discovered Signing Identity: $SIGNING_IDENTITY"
+            echo "CODE_SIGN_IDENTITY=$SIGNING_IDENTITY" >> $GITHUB_ENV
+          else
+            echo "CODE_SIGN_IDENTITY=iPhone Distribution" >> $GITHUB_ENV
+          fi
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> $GITHUB_ENV
+          echo "KEYCHAIN_PWD=$KEYCHAIN_PWD" >> $GITHUB_ENV
 
       - name: Install Provisioning Profile (.mobileprovision)
         env:
@@ -95,6 +105,23 @@ jobs:
           TEAM_ID=$(security cms -D -i "$PROFILE_RAW" 2>/dev/null | plutil -extract TeamIdentifier.0 raw - 2>/dev/null || echo "")
           echo "DEVELOPMENT_TEAM=$TEAM_ID" >> $GITHUB_ENV
           echo "Team ID: $TEAM_ID"
+
+          # Detect export method from profile
+          METHOD="ad-hoc"
+          if security cms -D -i "$PROFILE_RAW" 2>/dev/null | grep -q "<key>ProvisionedDevices</key>"; then
+            GET_TASK_ALLOW=$(security cms -D -i "$PROFILE_RAW" 2>/dev/null | plutil -extract Entitlements.get-task-allow raw - 2>/dev/null || echo "false")
+            if [ "$GET_TASK_ALLOW" = "true" ]; then
+              METHOD="development"
+            else
+              METHOD="ad-hoc"
+            fi
+          elif security cms -D -i "$PROFILE_RAW" 2>/dev/null | grep -q "<key>ProvisionsAllDevices</key>"; then
+            METHOD="enterprise"
+          else
+            METHOD="app-store"
+          fi
+          echo "Detected export method: $METHOD"
+          echo "EXPORT_METHOD=$METHOD" >> $GITHUB_ENV
 
       - name: Auto-Sync Bundle Identifier with Provisioning Profile
         run: |
@@ -182,6 +209,9 @@ EOF
         run: |
           mkdir -p build/output
 
+          # Mở khóa keychain trước khi ký
+          security unlock-keychain -p "${{ env.KEYCHAIN_PWD }}" "${{ env.KEYCHAIN_PATH }}" || true
+
           WORKSPACE=$(find . -maxdepth 2 -name "*.xcworkspace" | head -n 1)
           PROJECT=$(find . -maxdepth 2 -name "*.xcodeproj" | head -n 1)
 
@@ -199,7 +229,7 @@ EOF
             exit 1
           fi
 
-          # Phát hiện scheme an toàn bằng Python
+          # Phát hiện scheme an toàn
           SCHEME="ThreeOneOSFive"
           RAW_LIST=$(xcodebuild $BUILD_TARGET -list -json 2>/dev/null || true)
           DETECTED_SCHEME=$(python3 -c '
@@ -232,40 +262,45 @@ except Exception:
             -archivePath build/App.xcarchive \
             -destination "generic/platform=iOS" \
             CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="${{ env.CODE_SIGN_IDENTITY }}" \
             PROVISIONING_PROFILE_SPECIFIER="${{ env.PROVISIONING_PROFILE_UUID }}" \
             DEVELOPMENT_TEAM="${{ env.DEVELOPMENT_TEAM }}" \
+            CODE_SIGNING_REQUIRED=YES \
+            CODE_SIGNING_ALLOWED=YES \
             COMPILER_INDEX_STORE_ENABLE=NO
 
           # Đọc Bundle ID thực tế từ archive
           ARCHIVE_BUNDLE_ID=$(plutil -extract ApplicationProperties.CFBundleIdentifier raw build/App.xcarchive/Info.plist 2>/dev/null || echo "${TARGET_BUNDLE_ID:-com.example.app}")
           echo "Archive Bundle ID: $ARCHIVE_BUNDLE_ID"
 
-          # Sinh ExportOptions.plist tự động
-          cat << EOF > ExportOptions.plist
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>method</key>
-              <string>ad-hoc</string>
-              <key>signingStyle</key>
-              <string>manual</string>
-              <key>stripSwiftSymbols</key>
-              <true/>
-              <key>compileBitcode</key>
-              <false/>
-              <key>thinning</key>
-              <string>&lt;none&gt;</string>
-              <key>teamID</key>
-              <string>${{ env.DEVELOPMENT_TEAM }}</string>
-              <key>provisioningProfiles</key>
-              <dict>
-                  <key>${ARCHIVE_BUNDLE_ID}</key>
-                  <string>${{ env.PROVISIONING_PROFILE_UUID }}</string>
-              </dict>
-          </dict>
-          </plist>
-          EOF
+          # Tạo ExportOptions.plist hợp lệ bằng Python để tránh lỗi cú pháp heredoc
+          python3 -c '
+import plistlib, os
+
+export_method = os.environ.get("EXPORT_METHOD", "ad-hoc")
+team_id = os.environ.get("DEVELOPMENT_TEAM", "")
+profile_uuid = os.environ.get("PROVISIONING_PROFILE_UUID", "")
+bundle_id = os.environ.get("ARCHIVE_BUNDLE_ID", "")
+signing_identity = os.environ.get("CODE_SIGN_IDENTITY", "iPhone Distribution")
+
+plist_data = {
+    "method": export_method,
+    "signingStyle": "manual",
+    "stripSwiftSymbols": True,
+    "compileBitcode": False,
+    "thinning": "<none>",
+    "teamID": team_id,
+    "signingCertificate": signing_identity,
+    "provisioningProfiles": {
+        bundle_id: profile_uuid
+    }
+}
+
+with open("ExportOptions.plist", "wb") as f:
+    plistlib.dump(plist_data, f)
+print("ExportOptions.plist created successfully:")
+'
+          cat ExportOptions.plist
 
           echo "Exporting IPA..."
           xcodebuild -exportArchive \
